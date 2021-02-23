@@ -4,6 +4,7 @@ import matplotlib.pyplot as plt
 
 from scipy.stats import norm  # For inverse of Gaussian CDF, norm.ppf
 from scipy.stats import chi2  # For testing purposes, chi2.rvs for samples, chi2.cdf for cdf
+from scipy.stats import special_ortho_group  # For random rotations
 
 class Gaussianizer(object):
     def __init__(self,rot_seed=42):
@@ -16,7 +17,10 @@ class Gaussianizer(object):
         self.nSteps = 0
         self.steps = []
         self.trained = False
-        self.rotation_seed = 42
+        self.rotation_seed = rot_seed  # Not implemented Yet
+        self.init_samples = None
+        self.gaussian_samples = None
+        self.dim = None
         return
 
     def gaussianize(self,samp,ns,condition=None):
@@ -28,9 +32,12 @@ class Gaussianizer(object):
           ns        : Number of steps to take
           condition : (optional) Function defining stopping condition (not implemented)
         """
+        self.dim = samp.shape[0]
+        self.init_samples = np.copy(samp)
         for i in range(ns):
-            self.train_step(samp)
+            samp = self.train_step(samp)
         self.trained = True
+        self.gaussian_samples = samp
         return
         
     def train_step(self,samp):
@@ -43,7 +50,21 @@ class Gaussianizer(object):
         newStep = Transform_Step(rot,mean,cdf_v,cdf)
         self.steps.append(newStep)
         return sw
-        
+
+    # Need to debug this more (and test with output of inverse_transform, etc.  Decide which is fastest)
+    def create_samples(self,nSamp):
+        """
+        Return a new realisation of samples from the trained transform.
+
+        Input:
+          nSamp : Number of samples to generate
+        """
+        g = np.random.normal(size=(self.dim,nSamp))
+        for i in range(self.nSteps-1,-1,-1):  # Check indexing here
+            g = invert_step(g,self.steps[i].rot,self.steps[i].mean,self.steps[i].cdf_v,self.steps[i].cdf)
+        return g
+
+    # Need to write this code in the transform object
     def forward_transform(self,y):
         x = y
         for i in range(self.nSteps):
@@ -52,7 +73,7 @@ class Gaussianizer(object):
 
     def inverse_transform(self,x):
         y = x
-        for i in range(self.nStep-1,-1,-1):
+        for i in range(self.nSteps-1,-1,-1):
             y = self.steps[i].backward(y)
         return y
 
@@ -76,62 +97,57 @@ class Transform_Step(object):
         self.mean = mean
         return
 
-    def forward(x):
-        x = x-self.mean[:,np.newaxis]
-        return self.cdf(self.rot@x)
+    def forward(self,x):
+        x = x - self.mean[:,np.newaxis]
+        x = self.rot@x
+        # Write forward_transform interpolation
+        return self.cdf(x)
 
-    def backward(y):
-        y = self.cdf_inv(y)
-        y = self.rot.T@y
-        y = y + self.mean[:,np.newaxis]
+    def backward(self,y):
+        y = degaussianize(y,self.cdf_v,self.cdf)
+        y = self.rot.T@y + self.mean[:,np.newaxis]
         return y
-    
-    def cdf(samp):
-        return
 
-    def cdf_inv(samp):
-        return
-
-class Function_Estimator(object):
-    def __init__(self,xv,yv):
-        self.xvals = xv
-        self.yvals = yv
-        return
-
-    # This is currently a horrible approximation
-    def value(self,x):
-        ii = np.argmin(x>self.xv)
-        slope = (self.yv[ii+1]-self.yv[ii]) / (self.xv[ii+1]-self.xv[ii])
-        return 
-
-    def deriv(self,x):
-        ii = np.argmin(x>xv)
-        slope = (self.yv[ii+1]-self.yv[ii]) / (self.xv[ii+1]-self.xv[ii])
-        return slope
-    
 # Here's an idea
 # Do a merge type operation.  Rotate pairs
 # Then rotate in the rotated pairs, etc.
-def random_rotation(samp):
+def random_block_rotation(samp,blockSize=2):
     """
-    Randomly rotate between pairs of randomly chosen directions
+    Randomly rotate samples using subblocks of size blockSize.
     """
     d = samp.shape[0]
     shuffle = np.random.permutation(np.arange(d))
-
+    
+    if (d%2 == 1):
+        pass
     # Write this
     return
-    
+
+def rot_2d(theta):
+    """
+    Returns rotation matrix for a theta radian clockwise rotation
+    """
+    return np.array([[np.cos(theta), np.sin(theta)],[-np.sin(theta),np.cos(theta)]])
+
 # Make sure this is the correct thing to do
 # Currently doing random rotations.  Need to fix
 def rotate_samples(samp,use_cov=False):
+    """
+    Rotate the set of input samples using a random rotation drawn from SO(d) where d is the dimension of the samples or using an SVD.
+
+    For very large sample spaces, these large dimensional rotations will be rather inefficient both in terms of matrix multiplication times and storage requirements.  More optimal rotation choices could be applied in this case.
+
+    Input:
+       samp : The samples.  Exist as a (d)x(n_sample) numpy array
+       use_cov (optional) : Boolean choosing whether to rotate using a random rotation or SVD decomposition
+    """
     mu = np.mean(samp,axis=-1)
-    sw = samp - np.mean(samp,axis=-1)[:,np.newaxis]
+    sw = samp - mu[:,np.newaxis]
     if use_cov:
         cov = np.cov(sw,rowvar=True)
         u,sig,v = np.linalg.svd(cov,hermitian=True)
     else:
-        v = rot_2d(np.random.uniform(low=0.,high=2.*np.pi))  # random rotations
+        v = special_ortho_group.rvs(samp.shape[0])
     return v@sw, v, mu
 
 # Currently using the ugly solution of sorting the indexed keys
@@ -145,6 +161,43 @@ def marginal_gaussianize(samp):
     jj = np.argsort(ii,axis=-1)  # Can I turn this into a single line
     c_ = np.sort(samp,axis=-1)
     return g_[jj], c_, p_
+
+### Write this and the next function
+def learn_gaussianize(samp,binSize=128):
+    ns = samp.shape[-1]
+
+    partitions = np.arange(start=binSize//2,stop=ns,step=binSize)
+    pVal = partitions / np.float64(partitions.size)  # Check this
+    gaussVal = norm.ppf(pVal)
+
+    ii = np.argsort(samp,axis=-1)
+    jj = np.argsort(ii,axis=-1)
+    #jj[:,partitions] # This about this
+    return
+
+def learn_cdf(samp):
+    ns = samp.shape[-1]
+    binSize = 128
+
+    nBins = ns // binSize; binExtra = ns % binSize
+    nPart = nBins
+
+    partitions = np.arange(start=binSize//2,stop=ns,step=binSize)
+    
+    #pVal = np.concatenate( (1./ns,0.5/nPart+np.arange(nPart)/nPart,1.-1./ns) ) # including endpoints
+    pVal = 0.5/np.float64(nPart) + np.arange(nPart)/np.float64(nPart)
+    gaussVal = norm.ppf(pVal)
+    # Divide extra samples between left and right.
+    # Even vs odd samples
+    
+    # This is painfully slow, but at least scales correctly
+    ii = np.argsort(samp,axis=-1)
+    jj = np.argsort(ii,axis=-1)
+    # Check this given extra axes
+    #jj = jj[partitions]  # Get array of the partition indices
+    return 
+
+#### End of to write section
 
 def compute_cdf_1d(x,xvals,cdf):
     eps = 0.1/cdf.size
@@ -187,12 +240,6 @@ def step(samp):
     z,c,p = marginal_gaussianize(sw)
     return z,c,p,rot,mu
 
-def rot_2d(theta):
-    """
-    Returns rotation matrix for a theta radian clockwise rotation
-    """
-    return np.array([[np.cos(theta), np.sin(theta)],[-np.sin(theta),np.cos(theta)]])
-
 def sample_checkerboard(nsamp,board_size=3):
     s = np.random.uniform(size=(2,0))
     for i in range(board_size):
@@ -216,12 +263,6 @@ def local_mapping(nSamp,nLat,f):
 def ring_pdf(nsamp):
     return
 
-def interpolate_transform(x,xv,yv):
-    return
-
-def interpolate_inverse_transform(x,xv,yv):
-    return
-
 def gaussianize_samples(samp,nStep):
     sw_ = []; s_=[]
     steps = []
@@ -236,32 +277,81 @@ def gaussianize_samples(samp,nStep):
         steps.append( Transform_Step(np.copy(r),np.copy(m),np.copy(c),np.copy(p)) )
     return sw_, s_, steps
         
-def make_scatter(s):
-    f,a = plt.subplots()
-    a.scatter(s[0],s[1],alpha=0.2,zorder=-10)
-    a.set_title(r'Step %02i' %i)
+def make_scatter(s,ind=(0,1),a=None,ti=0):
+    """
+    Make a scatter plot for the data s using pair of given indices.
+
+    Input:
+      s   - The data samples of shape (dim)x(n samples)
+      ind - The pair of indices to sample from
+      a   - axis to plot (if present), otherwise None
+      ti  - Step index (defaults to 0)
+    """
+    if a==None:
+        f,a = plt.subplots()
+    else:
+        f = a.get_figure()
+    a.scatter(s[ind(0)],s[ind(1)],alpha=0.2,zorder=-10)
     a.set_xlabel(r'$x_1^{(i)}$')
     a.set_ylabel(r'$x_2^{(i)}$')
     a.set_rasterization_zorder(-1)
-    f.savefig('step-%02i.pdf'%i)
+
+    a.set_title(r'Step %02i' % ti)
+    f.savefig('step-%02i.pdf' % ti)
     return f,a
-    
+
+# To Do here: 1) Make histograms (can fix bin sizes)
+#             2) Make CDFs
+#             3) Do tests like KS, etc.
+def test_marginal_gaussianity(samp,nAxes=10,rand_axes=True):
+    """
+    Test the gaussianity of the marginal distributions along a collection of axes.
+    This is done by rotating the samples and doing marginalisations along the coordinate axes
+
+    Input:
+      samp   : The samples to test
+      nAxes  : Number of rotations to apply
+      rand_axes (Boolean) : If true, randomly sample the rotation axes
+    """
+    for i in range(nAxes):
+        rot = special_ortho_group.cvs(samp.shape[0])
+        sR = rot@samp
+        # Now insert code to do various tests.
+        # e.g. plt.hist(sR[0,:]); plt.hist(sR[1,:]), ...
+    return
+
+def _gaussianize_(s,nIt=500):
+    s_ = []; sw_ = []; steps = []
+    s_.append(np.copy(s))
+    for i in range(nIt):
+        sw,r,m = rotate_samples(s)
+        sw_.append(np.copy(sw))
+        s,c,p = marginal_gaussianize(sw)
+        s_.append(np.copy(s))
+        steps.append( Transform_Step(np.copy(r),np.copy(m),np.copy(c),np.copy(p)) )
+    return s_, sw_, steps
+
+def test_plot(step,gauss,i,j):
+    plt.plot(step[i].cdf_v[j],step[i].cdf)
+    plt.plot(gauss.steps[i].cdf_v[j],gauss.steps[i].cdf)
+    return
+
 if __name__=="__main__":
     myGauss = Gaussianizer()
     
-    samp = chi2.rvs(2,size=(2,1000))
-    rot = rot_2d(0.37*np.pi)
-
-#    print('Rotated Chi-Squared')
-#    z = rot@samp
-#    for i in range(5):
-#        z,c,p,r,m = step(z)
-
+    s = chi2.rvs(2,size=(3,1000))
+    rot = special_ortho_group.rvs(s.shape[0])
+    s = rot@s
+    sNew = norm.rvs(size=(3,1000),random_state=42)
+    s_cp = np.copy(s)
+    
     #s = sample_checkerboard(100)
-    s = gaussian_peaks(1000,3)
+    #s = gaussian_peaks(1000,3)
+
     sw_ = []; s_ = []
     steps = []
     s_.append(np.copy(s))
+    np.random.seed(42)
     for i in range(500):
 #        s,c,p,r,m = step(s)
         sw,r,m = rotate_samples(s)
@@ -270,33 +360,37 @@ if __name__=="__main__":
         s_.append(np.copy(s))
         step_cur = Transform_Step(np.copy(r),np.copy(m),np.copy(c),np.copy(p))
         steps.append(step_cur)
-        
-    s = gaussian_peaks(100,3)
-    cdf2 = []; cdf_v2 = []; rot2 = []; s2_ = []; mu2_ = []; sw2_ = []
-    s2_.append(np.copy(s))
-    for i in range(500):
-#        s,c,p,r,m = step(s)
-        sw,r,m = rotate_samples(s)
-        sw2_.append(np.copy(sw))
-        s,c,p = marginal_gaussianize(sw)
-        mu2_.append(m); cdf_v2.append(c); cdf2.append(p); rot2.append(r); s2_.append(np.copy(s))
- 
-    sNew = norm.rvs(size=(2,1000),random_state=42)
-    s0 = np.copy(sNew)
 
-    sNew_ = []
-    for j in [499,399,299,199,99]:
-        sNew = s0
-        for i in range(j,-1,-1):
-            r = steps[i].rot; mu = steps[i].mean; cdf_v = steps[i].cdf_v; cdf = steps[i].cdf
-            sNew = invert_step(sNew,r,mu,cdf_v,cdf)
-        sNew_.append(np.copy(sNew))
+    # Testing for the object
+    np.random.seed(42)
+    myGauss.gaussianize(s_cp,500)
+#    for i in range(500):
+#        s_cp = myGauss.train_step(s_cp)  # Figure out how to remove this ugly part
         
-    sNew2 = np.copy(s0)
-    for i in range(99,-1,-1):
-        sNew2 = invert_step(sNew2,rot2[i],mu2_[i],cdf_v2[i],cdf2[i])
+#    s = gaussian_peaks(100,3)
+#    cdf2 = []; cdf_v2 = []; rot2 = []; s2_ = []; mu2_ = []; sw2_ = []
+#    s2_.append(np.copy(s))
+#    for i in range(500):
+##        s,c,p,r,m = step(s)
+#        sw,r,m = rotate_samples(s)
+#        sw2_.append(np.copy(sw))
+#        s,c,p = marginal_gaussianize(sw)
+#        mu2_.append(m); cdf_v2.append(c); cdf2.append(p); rot2.append(r); s2_.append(np.copy(s))
+ 
+#    s0 = np.copy(sNew)
+#    sNew_ = []
+#    for j in [499,399,299,199,99]:
+#        sNew = s0
+#        for i in range(j,-1,-1):
+#            r = steps[i].rot; mu = steps[i].mean; cdf_v = steps[i].cdf_v; cdf = steps[i].cdf
+#            sNew = invert_step(sNew,r,mu,cdf_v,cdf)
+#        sNew_.append(np.copy(sNew))
+        
+#    sNew2 = np.copy(s0)
+#    for i in range(99,-1,-1):
+#        sNew2 = invert_step(sNew2,rot2[i],mu2_[i],cdf_v2[i],cdf2[i])
     # outlier analysis
-    ii2 = np.where( (np.abs(sNew2[0]%10-5)<2) | (np.abs(sNew2[1]%10-5)<2) )
+#    ii2 = np.where( (np.abs(sNew2[0]%10-5)<2) | (np.abs(sNew2[1]%10-5)<2) )
 
 #    plt.clf()
 #    for i in range(500):
